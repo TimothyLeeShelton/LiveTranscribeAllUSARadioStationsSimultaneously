@@ -1,0 +1,821 @@
+#!/usr/bin/env python3
+
+# Requirements:
+# requests==2.31.0
+# python-dotenv==1.0.0
+# SpeechRecognition==3.10.0
+# pydub==0.25.1
+# aiohttp==3.9.1
+# async-timeout==4.0.3
+# sounddevice==0.4.6
+# numpy==1.24.3
+# websockets==12.0
+# ffmpeg-python==0.2.0
+# openai-whisper==20231117
+
+# Model Download
+import whisper
+
+def download_whisper_model():
+    print("Starting model download...")
+    model = whisper.load_model("tiny.en")
+    print("Model downloaded and verified successfully!")
+    return model
+
+download_whisper_model()
+
+import sys
+import json
+import asyncio
+import aiohttp
+import tempfile
+import os
+import time
+import logging
+from datetime import datetime
+from pydub import AudioSegment
+import sounddevice as sd
+import numpy as np
+from queue import Queue
+import ffmpeg
+import tkinter as tk
+from tkinter import ttk, scrolledtext
+import threading
+
+# Custom logging handler that writes to a tkinter Text widget
+class TextHandler(logging.Handler):
+    def __init__(self, text_widget):
+        super().__init__()
+        self.text_widget = text_widget
+        
+    def emit(self, record):
+        msg = self.format(record)
+        def append():
+            self.text_widget.configure(state='normal')
+            self.text_widget.insert(tk.END, msg + '\n')
+            self.text_widget.see(tk.END)
+            self.text_widget.configure(state='disabled')
+        self.text_widget.after(0, append)
+
+class AudioBuffer:
+    def __init__(self, max_size=10):
+        self.buffer = Queue(maxsize=max_size)
+        
+    def add_audio(self, audio_chunk):
+        if not self.buffer.full():
+            self.buffer.put(audio_chunk)
+            return True
+        return False
+            
+    def get_audio(self):
+        if not self.buffer.empty():
+            return self.buffer.get()
+        return None
+
+class RadioStream(threading.Thread):
+    def __init__(self, station_id, station_name, stream_url, callback=None):
+        super().__init__()
+        self.station_id = station_id
+        self.station_name = station_name
+        self.stream_url = stream_url
+        self.running = True
+        self.audio_buffer = AudioBuffer()
+        self.chunk_size = 1024 * 32  # 32KB chunks
+        self.sample_rate = 44100     # Match the radio stream sample rate
+        self.target_audio_size = 960000  # Target 30 seconds of audio (960KB)
+        self.temp_dir = tempfile.mkdtemp()
+        self.callback = callback
+        self.loop = None
+        self.accumulated_audio = b""
+        self.last_process_time = time.time()
+        self.debug_file = None
+        self.last_transcription = None
+        self.play_audio = True  # Flag to control audio playback
+        
+        # Initialize audio output stream
+        self.audio_output = sd.OutputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype=np.int16
+        )
+        self.audio_output.start()
+        
+        # Initialize Whisper model (using the smallest model for speed)
+        self.model = whisper.load_model("tiny.en")
+        logging.info(f"Initialized Whisper model for {station_name}")
+        
+        # Create debug directory if it doesn't exist
+        self.debug_dir = os.path.join(os.getcwd(), "debug_audio")
+        os.makedirs(self.debug_dir, exist_ok=True)
+        
+        # Open debug file for writing audio samples
+        debug_file_path = os.path.join(self.debug_dir, f"{station_name.replace(' ', '_')}.mp3")
+        self.debug_file = open(debug_file_path, 'wb')
+        logging.info(f"Debug audio will be saved to: {debug_file_path}")
+
+    async def fetch_stream_url(self, station_id):
+        """Fetch the actual stream URL for a station"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            # First get channel data
+            channel_url = f"https://radio.garden/api/ara/content/channel/{station_id}"
+            logging.info(f"API Call: GET {channel_url}")
+            
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(channel_url, headers=headers) as response:
+                    if response.status != 200:
+                        logging.error(f"Error fetching channel data: HTTP {response.status}")
+                        return None
+                    
+                    channel_data = await response.json()
+                    logging.info(f"Got channel data: {channel_data}")
+                    
+                    # Now get the actual stream URL
+                    stream_url = f"https://radio.garden/api/ara/content/listen/{station_id}/channel.mp3"
+                    logging.info(f"API Call: GET {stream_url}")
+                    
+                    async with session.get(stream_url, headers=headers, allow_redirects=False) as response:
+                        if response.status in [301, 302, 303, 307, 308]:
+                            final_url = response.headers.get('Location')
+                            logging.info(f"Got stream URL from redirect: {final_url}")
+                            return final_url
+                        elif response.status == 200:
+                            return stream_url
+                        else:
+                            logging.error(f"Error getting stream URL: HTTP {response.status}")
+                            return None
+                            
+        except Exception as e:
+            logging.error(f"Error fetching stream URL: {str(e)}")
+            return None
+
+    async def process_stream(self):
+        """Process accumulated audio data"""
+        try:
+            current_time = time.time()
+            # Process every 5 seconds
+            if current_time - self.last_process_time >= 5 and len(self.accumulated_audio) > 0:
+                logging.info(f"Processing {len(self.accumulated_audio)} bytes of audio for {self.station_name}")
+                
+                # Save a copy of the audio to debug file
+                if self.debug_file:
+                    self.debug_file.write(self.accumulated_audio)
+                    self.debug_file.flush()
+                    logging.info(f"Saved audio sample to debug file for {self.station_name}")
+                    # Analyze the debug file
+                    self.analyze_debug_audio()
+                
+                # Process the audio
+                transcription = self.process_audio_chunk(self.accumulated_audio)
+                if transcription:
+                    logging.info(f"Got transcription for {self.station_name}: {transcription}")
+                    self.callback(self.station_name, transcription, self.station_id)
+                else:
+                    logging.warning(f"No transcription generated for {self.station_name}")
+                
+                self.accumulated_audio = b""
+                self.last_process_time = current_time
+        except Exception as e:
+            logging.error(f"Error processing stream for {self.station_name}: {str(e)}")
+
+    def analyze_debug_audio(self):
+        """Analyze the debug audio file and log information about it"""
+        try:
+            if not self.debug_file:
+                logging.info(f"No debug file available for {self.station_name}")
+                return
+                
+            # Get the current position and size
+            current_pos = self.debug_file.tell()
+            self.debug_file.seek(0, 2)  # Seek to end
+            total_size = self.debug_file.tell()
+            self.debug_file.seek(current_pos)  # Return to original position
+            
+            # Create a debug info file
+            debug_info_path = os.path.join(self.debug_dir, f"{self.station_name.replace(' ', '_')}_debug.txt")
+            with open(debug_info_path, 'w') as debug_info:
+                debug_info.write(f"Debug Info for {self.station_name}\n")
+                debug_info.write(f"{'='*50}\n")
+                debug_info.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                debug_info.write(f"Audio File Size: {total_size} bytes\n")
+                debug_info.write(f"Audio File Path: {self.debug_file.name}\n")
+                debug_info.write(f"Current Write Position: {current_pos}\n")
+                debug_info.write(f"Receiving Data: {'Yes' if total_size > 0 else 'No'}\n")
+                
+                # Try to check if it's valid MP3 data
+                if total_size > 0:
+                    try:
+                        # Read first few bytes to check for MP3 header
+                        current_pos = self.debug_file.tell()
+                        self.debug_file.seek(0)
+                        header = self.debug_file.read(4)
+                        self.debug_file.seek(current_pos)
+                        
+                        # Check for MP3 header (0xFF followed by 0xFB or 0xFA or 0xF3 or 0xF2)
+                        is_mp3 = (header[0] == 0xFF and header[1] in [0xFB, 0xFA, 0xF3, 0xF2])
+                        debug_info.write(f"Valid MP3 Header: {'Yes' if is_mp3 else 'No'}\n")
+                        debug_info.write(f"First 4 bytes: {' '.join(f'{b:02X}' for b in header)}\n")
+                    except Exception as e:
+                        debug_info.write(f"Error checking MP3 header: {str(e)}\n")
+                
+                # Add stream information
+                debug_info.write("\nStream Information:\n")
+                debug_info.write(f"{'='*50}\n")
+                debug_info.write(f"Chunk Size: {self.chunk_size} bytes\n")
+                debug_info.write(f"Sample Rate: {self.sample_rate} Hz\n")
+                debug_info.write(f"Accumulated Audio Size: {len(self.accumulated_audio)} bytes\n")
+                
+            logging.info(f"Wrote debug info to {debug_info_path}")
+            
+        except Exception as e:
+            logging.error(f"Error analyzing debug audio: {str(e)}")
+
+    async def stream_audio(self):
+        while self.running:  # Keep trying to reconnect while running
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+                
+                timeout = aiohttp.ClientTimeout(total=30, sock_read=10)  # Add timeout settings
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    logging.info(f"Connecting to stream at {self.stream_url}")
+                    try:
+                        async with session.get(self.stream_url, headers=headers) as response:
+                            if response.status not in [200, 206]:
+                                logging.error(f"Error connecting to {self.station_name}: HTTP {response.status}")
+                                logging.error(f"Response headers: {dict(response.headers)}")
+                                await asyncio.sleep(5)  # Wait before retry
+                                continue
+                            
+                            logging.info(f"Connected to stream for {self.station_name}")
+                            logging.info(f"Content-Type: {response.headers.get('Content-Type', 'unknown')}")
+                            logging.info(f"Content-Length: {response.headers.get('Content-Length', 'unknown')}")
+                            logging.info(f"All response headers: {dict(response.headers)}")
+                            
+                            chunk_count = 0
+                            while self.running:
+                                try:
+                                    chunk = await response.content.read(self.chunk_size)
+                                    if not chunk:
+                                        logging.warning(f"Empty chunk received for {self.station_name}, reconnecting...")
+                                        break
+                                    
+                                    chunk_size = len(chunk)
+                                    if chunk_size > 0:
+                                        if self.debug_file:
+                                            self.debug_file.write(chunk)
+                                            self.debug_file.flush()
+                                        
+                                        self.accumulated_audio += chunk
+                                        
+                                        # Process accumulated audio if we have enough (30 seconds worth) or max time reached
+                                        current_time = time.time()
+                                        if (len(self.accumulated_audio) >= self.target_audio_size or 
+                                            current_time - self.last_process_time >= 30):  
+                                            
+                                            logging.info(f"Processing {len(self.accumulated_audio)/1024:.2f}KB of audio (~{len(self.accumulated_audio)/32000:.1f} seconds) for {self.station_name}")
+                                            self.process_audio_chunk(self.accumulated_audio)
+                                            self.accumulated_audio = b""
+                                            self.last_process_time = current_time
+                                        
+                                        chunk_count += 1
+                                        if chunk_count % 10 == 0:
+                                            logging.info(f"Received {chunk_count} chunks from {self.station_name} (last chunk size: {chunk_size}, accumulated: {len(self.accumulated_audio)} bytes)")
+                                except asyncio.TimeoutError:
+                                    logging.warning(f"Timeout while reading from {self.station_name}, reconnecting...")
+                                    break
+                                except Exception as e:
+                                    logging.error(f"Error reading chunk from {self.station_name}: {str(e)}")
+                                    break
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        logging.error(f"Connection error for {self.station_name}: {str(e)}")
+                        await asyncio.sleep(5)  # Wait before retry
+                        continue
+                        
+            except Exception as e:
+                logging.error(f"Error in stream_audio for {self.station_name}: {str(e)}")
+                await asyncio.sleep(5)  # Wait before retry
+            
+            if self.running:
+                logging.info(f"Attempting to reconnect to {self.station_name} in 5 seconds...")
+                await asyncio.sleep(5)
+
+    def process_audio_chunk(self, audio_data):
+        try:
+            # Convert MP3 chunk to WAV using ffmpeg
+            temp_mp3 = os.path.join(self.temp_dir, f"temp_{self.station_id}.mp3")
+            temp_wav = os.path.join(self.temp_dir, f"temp_{self.station_id}.wav")
+            
+            with open(temp_mp3, 'wb') as f:
+                f.write(audio_data)
+            
+            logging.info(f"Converting audio chunk for {self.station_name}")
+            
+            # Convert to WAV using ffmpeg, keeping original sample rate
+            try:
+                stream = ffmpeg.input(temp_mp3)
+                stream = ffmpeg.output(stream, temp_wav, 
+                    acodec='pcm_s16le',    # 16-bit PCM
+                    ac=1,                  # Mono
+                    ar=self.sample_rate)   # Keep original 44.1kHz
+                ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
+            except ffmpeg.Error as e:
+                logging.error(f"FFmpeg error for {self.station_name}: {str(e)}")
+                return ""
+                
+            logging.info(f"Transcribing audio for {self.station_name}")
+            
+            # Use Whisper for transcription
+            result = self.model.transcribe(temp_wav, language='en')
+            text = result["text"].strip()
+            
+            if text:
+                logging.info(f"Transcribed text from {self.station_name}: {text}")
+                # Call the callback with the transcribed text
+                if self.callback:
+                    self.callback(self.station_name, text, self.station_id)
+                return text
+            else:
+                logging.warning(f"No transcription generated for {self.station_name}")
+                return ""
+            
+            # Play audio if enabled
+            if self.play_audio:
+                # Read the WAV file using pydub
+                audio_segment = AudioSegment.from_wav(temp_wav)
+                # Convert to numpy array for sounddevice
+                samples = np.array(audio_segment.get_array_of_samples())
+                # Play through sounddevice
+                self.audio_output.write(samples)
+                
+        except Exception as e:
+            logging.error(f"Error processing audio chunk for {self.station_name}: {str(e)}")
+            return ""
+        finally:
+            # Cleanup temporary files
+            try:
+                os.remove(temp_mp3)
+                os.remove(temp_wav)
+            except:
+                pass
+                
+    def run(self):
+        """Main thread method that sets up and runs the async event loop"""
+        logging.info(f"Starting main processing loop for {self.station_name}")
+        # Create new event loop for this thread
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        
+        try:
+            # Run the streaming task
+            self.loop.run_until_complete(self.stream_audio())
+        except Exception as e:
+            logging.error(f"Error in main loop for {self.station_name}: {str(e)}")
+        finally:
+            self.loop.close()
+            logging.info(f"Closed event loop for {self.station_name}")
+
+    def stop(self):
+        """Stop the streaming thread"""
+        logging.info(f"Stopping stream for {self.station_name}")
+        self.running = False
+        if self.loop and self.loop.is_running():
+            self.loop.stop()
+        if self.debug_file:
+            self.debug_file.close()
+        logging.info(f"Stream stopped for {self.station_name}")
+
+    def toggle_audio(self):
+        """Toggle audio playback on/off"""
+        self.play_audio = not self.play_audio
+        logging.info(f"Audio playback {'enabled' if self.play_audio else 'disabled'} for {self.station_name}")
+
+    def __del__(self):
+        self.stop()
+        if self.debug_file:
+            self.debug_file.close()
+        if hasattr(self, 'audio_output'):
+            self.audio_output.stop()
+            self.audio_output.close()
+
+class RadioMonitor:
+    def __init__(self):
+        # Initialize variables first
+        self.active_streams = {}
+        self.contest_keywords = [
+            ("contest", None),
+            ("giveaway", None),
+            ("win", None),
+            ("prize", None),
+            ("sweepstakes", None),
+            ("caller", ["now"]),
+            ("call now", None),
+            ("phone", ["now"]),
+            ("cash", None),
+            ("money", None),
+            ("free", None),
+            ("vacation", None),
+            ("text to win", None)
+        ]
+        self.is_monitoring = False
+        self.current_filter = "all"
+        
+        # Store transcription history for each station
+        self.transcription_history = {"all": []}  # "all" contains every transcription
+        
+        # Store station buttons
+        self.station_buttons = {}  # Store station buttons
+        
+        # Then create the UI
+        self.root = tk.Tk()
+        self.root.title("Radio Station Monitor")
+        self.root.geometry("1200x800")
+        
+        # Setup logging
+        self.setup_logging()
+        
+        # Setup main UI
+        self.setup_ui()
+        
+    def setup_logging(self):
+        # Create main logging handler
+        log_frame = ttk.Frame(self.root)
+        log_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
+        
+        self.log_text = tk.Text(log_frame, wrap=tk.WORD, height=10)
+        self.log_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        # Add scrollbar
+        log_scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.configure(yscrollcommand=log_scrollbar.set)
+        
+        # Configure logging
+        text_handler = TextHandler(self.log_text)
+        text_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        
+        logger = logging.getLogger()
+        logger.addHandler(text_handler)
+        logger.setLevel(logging.INFO)
+        
+        # Disable the text widget initially
+        self.log_text.configure(state='disabled')
+
+    def setup_ui(self):
+        # Set up window close handler
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # Main content area (everything except logs)
+        content_frame = ttk.Frame(self.root)
+        content_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Left side (controls and status)
+        left_frame = ttk.Frame(content_frame)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
+        
+        # Controls frame
+        controls_frame = ttk.LabelFrame(left_frame, text="Controls")
+        controls_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        ttk.Label(controls_frame, text="Max Active Channels:").pack(pady=5)
+        self.channel_limit = ttk.Spinbox(controls_frame, from_=1, to=10, width=5)
+        self.channel_limit.set(5)
+        self.channel_limit.pack(pady=5)
+        
+        # Buttons
+        self.start_button = ttk.Button(controls_frame, text="Start Monitoring", command=self.start_monitoring)
+        self.start_button.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.stop_button = ttk.Button(controls_frame, text="Stop Monitoring", command=self.stop_monitoring, state='disabled')
+        self.stop_button.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Status frame
+        status_frame = ttk.LabelFrame(left_frame, text="Status")
+        status_frame.pack(fill=tk.X, pady=5)
+        
+        self.status_label = ttk.Label(status_frame, text="Not Monitoring", foreground="red")
+        self.status_label.pack(pady=5)
+        
+        # Active stations frame
+        stations_frame = ttk.LabelFrame(left_frame, text="Active Stations")
+        stations_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Add "All Stations" button
+        self.all_stations_btn = ttk.Button(stations_frame, text="All Stations", 
+                                         command=lambda: self.filter_transcriptions("all"))
+        self.all_stations_btn.pack(fill=tk.X, padx=5, pady=(5,0))
+        
+        # Container for station buttons
+        self.stations_container = ttk.Frame(stations_frame)
+        self.stations_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Right side (transcriptions and alerts)
+        right_frame = ttk.Frame(content_frame)
+        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Create split view
+        paned_window = ttk.PanedWindow(right_frame, orient=tk.HORIZONTAL)
+        paned_window.pack(fill=tk.BOTH, expand=True)
+        
+        # Transcription frame
+        transcription_frame = ttk.Frame(paned_window)
+        ttk.Label(transcription_frame, text="Live Transcriptions").pack()
+        self.transcription_area = tk.Text(transcription_frame, wrap=tk.WORD)
+        self.transcription_area.pack(fill=tk.BOTH, expand=True)
+        paned_window.add(transcription_frame)
+        
+        # Contest alerts frame
+        contest_frame = ttk.Frame(paned_window)
+        ttk.Label(contest_frame, text="Contest Alerts").pack()
+        self.contest_area = tk.Text(contest_frame, wrap=tk.WORD)
+        self.contest_area.pack(fill=tk.BOTH, expand=True)
+        paned_window.add(contest_frame)
+    
+    def update_status(self, is_monitoring):
+        self.is_monitoring = is_monitoring
+        if is_monitoring:
+            self.status_label.config(text="Monitoring", foreground="green")
+            self.start_button.config(state='disabled')
+            self.stop_button.config(state='normal')
+            self.channel_limit.config(state='disabled')
+        else:
+            self.status_label.config(text="Not Monitoring", foreground="red")
+            self.start_button.config(state='normal')
+            self.stop_button.config(state='disabled')
+            self.channel_limit.config(state='normal')
+    
+    def add_station(self, station_id, station_name, stream_url):
+        if station_id not in self.active_streams:
+            stream = RadioStream(station_id, station_name, stream_url, self.handle_transcription)
+            self.active_streams[station_id] = stream
+            stream.start()
+            
+            # Add station button if it doesn't exist
+            if station_id not in self.station_buttons:
+                button = ttk.Button(
+                    self.stations_container,
+                    text=station_name,
+                    command=lambda: self.filter_transcriptions(station_id, station_name)
+                )
+                button.pack(fill=tk.X, padx=5, pady=2)
+                self.station_buttons[station_id] = button
+            
+            logging.info(f"Added station: {station_name}")
+            return True
+        return False
+
+    def update_stations_list(self, stations=None):
+        # Clear existing station buttons
+        for widget in self.stations_container.winfo_children():
+            widget.destroy()
+        self.station_buttons.clear()
+        
+        if stations:
+            for station in stations:
+                btn = ttk.Button(
+                    self.stations_container,
+                    text=station['name'],
+                    command=lambda sid=station['id'], sname=station['name']: 
+                        self.filter_transcriptions(sid, sname)
+                )
+                btn.pack(fill=tk.X, padx=5, pady=2)
+                self.station_buttons[station['id']] = btn
+    
+    def start_monitoring(self):
+        self.update_status(True)
+        self.load_stations()
+    
+    def stop_monitoring(self):
+        logging.info("Stopping all streams...")
+        # Stop all streams in a non-blocking way
+        def stop_streams():
+            for stream in self.active_streams.values():
+                stream.stop()
+            for stream in self.active_streams.values():
+                stream.join(timeout=1.0)  # Wait max 1 second per stream
+            self.active_streams.clear()
+            
+            # Update UI in the main thread
+            self.root.after(0, self._update_after_stop)
+        
+        # Run the stopping in a separate thread
+        threading.Thread(target=stop_streams, daemon=True).start()
+    
+    def _update_after_stop(self):
+        # Update UI
+        self.update_status(False)
+        self.update_stations_list()
+        
+        # Clear station buttons but keep transcription history
+        for station_id in list(self.station_buttons.keys()):
+            self.station_buttons[station_id].destroy()
+        self.station_buttons.clear()
+        
+        logging.info("Monitoring stopped")
+    
+    def on_closing(self):
+        logging.info("Application closing...")
+        if self.is_monitoring:
+            self.stop_monitoring()
+        # Give a short time for cleanup
+        self.root.after(500, self.root.destroy)
+
+    async def fetch_us_stations(self):
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json',
+            'Referer': 'https://radio.garden/'
+        }
+        
+        places_url = 'https://radio.garden/api/ara/content/places'
+        logging.info(f"API Call: GET {places_url}")
+        
+        async with aiohttp.ClientSession() as session:
+            try:
+                # First, get all places
+                logging.info("Fetching radio stations list...")
+                async with session.get(places_url, headers=headers) as response:
+                    if response.status != 200:
+                        logging.error(f"Failed to fetch stations list: HTTP {response.status}")
+                        logging.error(f"Response: {await response.text()}")
+                        return []
+                        
+                    places_data = await response.json()
+                    # Filter for US cities that end with " OR"
+                    us_cities = [
+                        place for place in places_data['data']['list']
+                        if place.get('country') == 'United States' and place.get('title', '').endswith(' OR')
+                    ]
+                    
+                    logging.info(f"Found {len(us_cities)} Oregon cities")
+                    stations = []
+                    
+                    for city in us_cities:
+                        try:
+                            # Get stations for each city
+                            city_url = f"https://radio.garden/api/ara/content/page/{city['id']}"
+                            logging.info(f"API Call: GET {city_url}")
+                            
+                            async with session.get(city_url, headers=headers) as city_response:
+                                if city_response.status != 200:
+                                    logging.error(f"Failed to fetch stations for {city['title']}: HTTP {city_response.status}")
+                                    logging.error(f"Response: {await city_response.text()}")
+                                    continue
+                                    
+                                city_data = await city_response.json()
+                                
+                                # Extract stations from city data
+                                for content in city_data['data']['content']:
+                                    if content.get('itemsType') == 'channel':
+                                        for item in content.get('items', []):
+                                            if 'page' in item and item['page'].get('type') == 'channel':
+                                                station_id = item['page']['url'].split('/')[-1]
+                                                station_name = f"{item['page']['title']} ({city['title']})"
+                                                stations.append({
+                                                    'id': station_id,
+                                                    'name': station_name,
+                                                    'url': None  # We'll fetch the actual URL when streaming
+                                                })
+                                                logging.info(f"Found station: {station_name} (ID: {station_id})")
+                                                if len(stations) >= int(self.channel_limit.get()):
+                                                    return stations
+                        except Exception as e:
+                            logging.error(f"Error fetching stations for {city['title']}: {str(e)}")
+                            continue
+                    
+                    return stations
+                    
+            except Exception as e:
+                logging.error(f"Error fetching stations: {str(e)}")
+                return []
+    
+    def handle_transcription(self, station_name, transcription, station_id):
+        # Add transcription to the main area using after() to be thread-safe
+        self.root.after(0, self._update_transcription, station_name, transcription, station_id)
+    
+    def _update_transcription(self, station_name, transcription, station_id):
+        # Create timestamp
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        formatted_text = f"[{timestamp}] {station_name}: {transcription}\n{'='*50}\n"
+        
+        # Store in history
+        if station_id not in self.transcription_history:
+            self.transcription_history[station_id] = []
+        self.transcription_history[station_id].append(formatted_text)
+        self.transcription_history["all"].append(formatted_text)
+        
+        # Update display if this station is currently being viewed
+        if self.current_filter == "all" or self.current_filter == station_id:
+            self.transcription_area.insert(tk.END, formatted_text)
+            self.transcription_area.see(tk.END)
+        
+        # Split transcription into words for whole-word matching
+        transcription_words = set(word.strip('.,!?()[]{};"\'').lower() 
+                                for word in transcription.split())
+        
+        # Check for contest keywords with context
+        is_contest = False
+        
+        for keyword, required_context in self.contest_keywords:
+            # For multi-word keywords, check if the phrase exists in the transcription
+            if ' ' in keyword:
+                if keyword in transcription.lower():
+                    if required_context is None:
+                        is_contest = True
+                        break
+                    else:
+                        # Check if any required context words are present as whole words
+                        if any(context in transcription_words for context in required_context):
+                            is_contest = True
+                            break
+            # For single-word keywords, check if it exists as a whole word
+            elif keyword in transcription_words:
+                if required_context is None:
+                    is_contest = True
+                    break
+                else:
+                    # Check if any required context words are present as whole words
+                    if any(context in transcription_words for context in required_context):
+                        is_contest = True
+                        break
+        
+        if is_contest:
+            self.contest_area.insert(tk.END,
+                f"CONTEST ALERT!\nStation: {station_name}\n"
+                f"Transcription: {transcription}\n"
+                f"{'='*50}\n"
+            )
+            self.contest_area.see(tk.END)
+    
+    def filter_transcriptions(self, station_id, station_name=None):
+        """Filter transcriptions to show only those from the selected station"""
+        self.current_filter = station_id
+        
+        # Update button states
+        self.all_stations_btn.state(['!pressed'])
+        for btn in self.station_buttons.values():
+            btn.state(['!pressed'])
+        
+        # Clear current display
+        self.transcription_area.delete(1.0, tk.END)
+        
+        # Show history for selected filter
+        if station_id == "all":
+            self.all_stations_btn.state(['pressed'])
+            for text in self.transcription_history["all"]:
+                self.transcription_area.insert(tk.END, text)
+        else:
+            if station_id in self.station_buttons:
+                self.station_buttons[station_id].state(['pressed'])
+                if station_id in self.transcription_history:
+                    for text in self.transcription_history[station_id]:
+                        self.transcription_area.insert(tk.END, text)
+        
+        self.transcription_area.see(tk.END)
+    
+    def load_stations(self):
+        async def async_load():
+            stations = await self.fetch_us_stations()
+            
+            # Update stations list in UI
+            self.root.after(0, self.update_stations_list, stations)
+            
+            # Start streaming for each station
+            for station in stations:
+                if station['id'] not in self.active_streams:
+                    stream_url = await RadioStream(station['id'], station['name'], station['url'], self.handle_transcription).fetch_stream_url(station['id'])
+                    if stream_url:
+                        stream = RadioStream(station['id'], station['name'], stream_url, self.handle_transcription)
+                        stream.start()
+                        self.active_streams[station['id']] = stream
+                        logging.info(f"Started monitoring: {station['name']}")
+        
+        # Create a new event loop and run the async function
+        def run_async():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(async_load())
+            loop.close()
+        
+        # Run the async operation in a separate thread
+        threading.Thread(target=run_async, daemon=True).start()
+        
+    def run(self):
+        self.root.mainloop()
+        
+    def cleanup(self):
+        for stream in self.active_streams.values():
+            stream.stop()
+            stream.join()
+
+if __name__ == '__main__':
+    app = RadioMonitor()
+    try:
+        app.run()
+    finally:
+        app.cleanup()
